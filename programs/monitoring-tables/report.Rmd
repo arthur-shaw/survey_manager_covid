@@ -1,0 +1,908 @@
+---
+title: "Monitoring report"
+output:
+    html_document:
+      toc: true
+      toc_float: true
+      toc_depth: 3
+params:
+ hhold_file: ""
+ attempt_list_var: ""
+ interview_result: ""
+ attempt_file: ""
+ attempt_time: "" 
+ answered_var: ""
+ talk_var: ""
+ consent: ""
+ number_file: ""
+ member_file: ""
+ reportStart: ""
+ reportEnd: ""
+ supervisors: NA
+ groupVar: NA
+ site: ""
+ user: ""
+ password: "" 
+---
+
+```{r knitr_options, include = FALSE, echo = FALSE, warning = FALSE, message = FALSE}
+
+# knitr options
+knitr::opts_chunk$set(
+	echo = FALSE, 
+	warning = FALSE,
+	message = FALSE,
+	out.width = '100%')
+
+```
+
+```{r load_libraries, eval = TRUE, include = FALSE}
+# external
+
+# packages needed for this program 
+packagesNeeded <- c(
+    "purrr",    # to help iteration over lists
+	"haven", 	# to injest input Stata files
+	"dplyr",	# to do basic data wrangling
+    "stringr",  # to perform text manipulation
+    "gt",       # to produce display tables
+    "tidyr",    # to reshape data
+	"lubridate", # to handle dates and filter to reporting period
+    "paletteer" # to create color palette for heat map
+)
+
+# identify and install those packages that are not already installed
+packagesToInstall <- packagesNeeded[!(packagesNeeded %in% installed.packages()[,"Package"])]
+if(length(packagesToInstall)) 
+	install.packages(packagesToInstall, quiet = TRUE, 
+		repos = 'https://cloud.r-project.org/', dep = TRUE)
+
+# load all needed packages
+lapply(packagesNeeded, library, character.only = TRUE)
+
+# internal
+programs <- c(
+    "interviewerResponsible.R", 
+    "getFieldStaffList.R",
+    "attempt_stats.R",
+    "contact_stats.R",
+    "conversion_stats.R",
+    "length_stats.R",
+    "getSuSoSyncData.R",
+    "when_interview_completed.R")
+walk(.x = programs, .f = ~ source(paste0(fcheckDir, "helper/", .x)))
+
+tableColor <- "#0F2B1D"
+
+```
+
+```{r modify_params}
+
+attempt_id_str <- str_replace(attempt_file, "\\.dta", "__id")
+attempt_id_sym <- sym(paste0(attempt_id_str))
+
+```
+
+```{r get_staff_list, eval = TRUE, include = FALSE}
+
+# interviewers to exclude
+ints_to_exclude <- c(
+    "none"  # TODO: specify those to exclude, if any
+)
+
+# determine responsibility for each interview: interviewer and supervisor
+# get supervisor list from server
+supervisors <- getSupervisors(site = params$site, user = params$user, password = params$password) %>%
+    rename_at(.vars = vars(IsLocked, CreationDate), .funs = ~ paste0("sup_", .)) %>%
+    filter(sup_IsLocked == FALSE)
+
+# get interviewer list from server
+interviewers <- purrr::map2_dfr(.x = supervisors$supervisorId, .y = supervisors$supervisor, .f = getInterviewers, 
+	site = params$site, user = params$user, password = params$password) %>%
+    rename_at(.vars = vars(IsLocked, CreationDate, DeviceId), .funs = ~ paste0("int_", .)) %>%
+    filter(int_IsLocked == FALSE) %>%
+    filter(!(interviewer %in% ints_to_exclude))
+	
+```
+
+```{r load_data}
+
+# set hhold data dir
+hhDataDir <- paste0(dataDir, "/hhold/combined/")
+
+# ingest data
+hholds <- read_dta(file = paste0(hhDataDir, params$hhold_file))
+attempts <- read_dta(file = paste0(hhDataDir, params$attempt_file))
+assign_actions <- read_dta(file = paste0(hhDataDir, "assignment__actions.dta"))
+int_actions <- read_dta(file = paste0(hhDataDir, "interview__actions.dta"))
+int_stats <- read_dta(file = paste0(hhDataDir, "interview__diagnostics.dta"))
+```
+
+```{r assignments_interviews}
+
+# assignments: df with assignments and following attributes: last interviewer assigned, 
+assignments <- assign_actions %>%
+mutate(
+    interviewer = if_else(
+        condition = responsible__role == 1, 
+        true = responsible__name, 
+        false = NA_character_, 
+        missing = NA_character_)
+) %>%
+group_by(assignment__id) %>%
+summarize(
+    was_received = any(action == 4), # was ever received by interviewer
+    interviewer = last(interviewer[!is.na(interviewer)]), # last interviewer
+    last_action = last(action)
+    ) %>%
+ungroup() %>%
+mutate(is_archived = last_action == 5) # last action is archived
+
+# interviews: df with interviews, interviewers last responsible for them, and their supervisor
+interviews_metadata <- interviewerResponsible(
+        dataFile = paste0(hhDataDir, "interview__actions.dta"),
+        exclusions = ints_to_exclude
+    ) %>%
+    left_join(interviewers, by = "interviewer") %>%
+    left_join(hholds, by = c("interview__id", "interview__key")) %>%
+    select(interview__id, interview__key, interviewer, supervisor, assignment__id, interview__status)
+
+# TODO: consider getting this from the server instead. Will get these details, but not is received
+# {
+#   "Assignments": [
+#     {
+#       "Id": 0,
+#       "ResponsibleId": "3fa85f64-5717-4562-b3fc-2c963f66afa6",
+#       "ResponsibleName": "string",
+#       "QuestionnaireId": "string",
+#       "InterviewsCount": 0,
+#       "Quantity": 0,
+#       "Archived": true,
+#       "CreatedAtUtc": "2020-04-14T15:17:35.264Z",
+#       "UpdatedAtUtc": "2020-04-14T15:17:35.264Z",
+#       "Email": "string",
+#       "Password": "string",
+#       "WebMode": true
+#     }
+#   ],
+#   "Order": "string",
+#   "Limit": 0,
+#   "TotalCount": 0,
+#   "Offset": 0
+# }
+
+```
+
+# Attempt rate
+
+```{r attempt_rate}
+# Labels:
+#  value                 label
+#      1               Created
+#      2               Deleted
+#      3            Reassigned
+#      4      ReceivedByTablet
+#      5              Archived
+#      6            Unarchived
+#      7 AudioRecordingChanged
+#      8       QuantityChanged
+#      9        WebModeChanged
+
+# attempts per interview, with columns: assignment__id, interview__id, interview__key, num_attempts
+attempts_per_interview <- hholds %>%
+    select(assignment__id, interview__id, interview__key, starts_with(params$attempt_list_var)) %>%
+    mutate_at(.vars = vars(starts_with(params$attempt_list_var)), 
+        .funs = ~ if_else(. == "##N/A##", NA_character_, .)) %>%
+    mutate_at(.vars = vars(starts_with(params$attempt_list_var)), 
+        .funs = ~!is.na(.)
+    ) %>%
+    mutate(num_attempts = 
+        rowSums(select(., starts_with(params$attempt_list_var)), na.rm = TRUE)) %>%
+    select(-starts_with(params$attempt_list_var))
+
+# interviewers: supervisors and their interviewers; some supervisor may not have interviewers
+# supervisor, interviewer
+
+# assignments: assignments with attribute
+# assignment__id, was_received, interviewer, last_action, is_archived
+
+# interviews_metadata: interviews and interviewer and supervisor responsible
+# interview__id, interview__key, interviewer, supervisor
+
+# interviews
+
+attempts_attribs <- interviewers %>% # all interviewers and supervisors
+    full_join(assignments, by = "interviewer") %>% # all assignments
+    filter(is_archived == FALSE | is.na(is_archived)) %>% # remove archived assignments
+    left_join(interviews_metadata, by = c("assignment__id", "interviewer", "supervisor")) %>% # add interviews
+    left_join(attempts_per_interview, 
+        by = c("assignment__id", "interview__id", "interview__key")) %>%
+    mutate(
+        was_received = if_else(was_received == FALSE & !is.na(interview__id), TRUE, was_received),
+        num_attempts = case_when(
+            is.na(assignment__id) ~ NA_real_, # no assignment
+            was_received == FALSE & is.na(interview__id) ~ NA_real_,  # assignment, but not received
+            was_received == TRUE & is.na(interview__id) ~ 0,
+            !is.na(interview__id) ~ num_attempts 
+        ),
+        any_attempt = if_else(num_attempts > 0, TRUE, FALSE, NA),
+        no_attempt = if_else(num_attempts == 0, TRUE, FALSE, NA)
+    )
+
+attempts_stats <- compute_attempt_stats(
+    df = attempts_attribs, 
+    group_var = interviewer, 
+    overall_txt = "All interviewers")
+
+attempts_stats %>% 
+gt(rowname_col = "interviewer") %>% 
+tab_header(title = "Contact attempts by interviewer") %>%
+cols_label(
+    num_assigned = html("Assigned<br>(N)"), 
+    perc_attempted = html("Attempted<br>(%)"), 
+    perc_no_attempted = html("Not attempted<br>(%)")) %>% 
+fmt_number(
+    columns = starts_with("perc"), 
+    scale_by = 100) %>%
+fmt_missing(columns = everything()) %>%
+tab_footnote(
+    footnote = "Assignments that are either not started or started but not synched.", 
+    locations = cells_column_labels(
+        columns = vars(perc_no_attempted))) %>%
+tab_footnote(
+    footnote = "Assignments received on the tablet only",
+    locations = cells_column_labels(
+        columns = vars(num_assigned)
+)) %>%
+tab_options(
+    heading.background.color = tableColor,
+    column_labels.background.color = tableColor)
+
+```
+
+# Contact rate
+
+```{r contact_rate}
+
+# summarize contacts across all of an interview's contact attempts
+contact_summary <- attempts %>%
+    group_by(interview__id) %>%
+    summarize(
+        last_attempt = last(!!sym(params$answered_var)),
+        # any attempt resulted in successful contact
+        reached = any(!!sym(params$answered_var) == 1, na.rm = TRUE),
+        # any attempt resulted in non-contact were further attempts may be profitable
+        not_reached = any(!!sym(params$answered_var) == 2 | is.na(!!sym(params$answered_var)), na.rm = TRUE) & any(!!sym(params$answered_var) %in% c(3, 4), na.rm = TRUE) & !any(!!sym(params$answered_var) == 1, na.rm = TRUE),
+        # all attempts resulted in non-contacts where further attepts are not profitable
+        unreachable = all(!!sym(params$answered_var) %in% c(3, 4), na.rm = TRUE)
+    ) %>%
+    ungroup()
+
+# compute statistics from contact summary
+contact_stats <- attempts_attribs %>% # assignments_w_interviews %>%
+    filter(!is.na(interviewer)) %>%
+    mutate(attempted = !is.na(interview__id)) %>%
+    full_join(contact_summary, by = "interview__id") %>%
+    select(interviewer, attempted, reached, not_reached, unreachable) %>%
+    group_by(interviewer) %>%
+    summarize(
+        num_attempts = sum(attempted, na.rm = TRUE),
+        num_reached = sum(reached, na.rm = TRUE),
+        num_not_reached = sum(not_reached, na.rm = TRUE),
+        num_unreachable = sum(unreachable, na.rm = TRUE)
+    ) %>%
+    mutate_at(.vars = vars(matches("reach")), .funs = ~ ./num_attempts) %>%
+    rename_at(.vars = vars(matches("reach")), .funs = ~ str_replace(., "num", "perc")) %>%
+    filter(!is.na(interviewer))
+
+# output a table
+contact_stats %>%
+gt(rowname_col = "interviewer") %>%
+tab_header(title = "Contact rate by interviewer") %>%
+cols_label(
+    num_attempts = html("Attempted<br>(N)"),
+    perc_reached = html("Reached<br>(%)"),
+    perc_not_reached = html("Not reached<br>(%)"),
+    perc_unreachable = html("Unreachable<br>(%)")
+) %>%
+tab_footnote(
+    footnote = "Any attempt resulted in successful contact",
+    locations = cells_column_labels(columns = vars(perc_reached))
+) %>%
+tab_footnote(
+    footnote = "Any attempt resulted in non-contact that may indicate possibility of continued contact attempts",
+    locations = cells_column_labels(columns = vars(perc_not_reached))
+) %>%
+tab_footnote(
+    footnote = "All attempts resulted in non-contact outcome where no further contacts can be profitably made.",
+    locations = cells_column_labels(columns = vars(perc_unreachable))
+) %>%
+fmt_missing(
+    columns = everything()
+) %>%
+fmt_number(
+    columns = starts_with("perc_"),
+    scale_by = 100
+) %>%
+tab_options(
+    heading.background.color = tableColor,
+    column_labels.background.color = tableColor)
+
+```
+
+# Reasons not reached
+
+TODO: Revise qnr to collect info
+
+# Reasons unreachable
+
+TODO: Revise qnr to collect info
+
+# Conversion rate
+
+```{r conversion_rate}
+
+# TODO: think about whether level of obs should be contacts or interviews
+# Currently, it's contacts
+
+conversion_summary <- attempts %>%
+    mutate(reached = !!sym(params$answered_var) == 1 & !!sym(params$talk_var) == 1) %>%
+    filter(reached == 1) %>%
+    mutate(
+        agreed = !!sym(params$consent) %in% c(1, 2),
+        refused = !!sym(params$consent) == 3
+    )
+
+conversion_stats <- compute_conversion_stats(
+    attempt_df = attempts_attribs, 
+    conversion_df = conversion_summary,
+	group_var = interviewer,
+    overall_txt = "All interviewers")
+
+conversion_stats %>%
+gt(rowname_col = "interviewer") %>%
+tab_header(title = "Conversion rate by interviewer") %>%
+cols_label(
+    num_reached = html("Reached<br>(N)"),
+    perc_agreed = html("Agreed<br>(%)"),
+    perc_refused = html("Refused<br>(%)")
+) %>%
+fmt_number(
+    columns = starts_with("perc_"),
+    scale_by = 100
+) %>%
+fmt_missing(
+    columns = everything()
+) %>%
+tab_footnote(
+    footnote = "Includes agreement to participate either now or a time proposed by the respondent", 
+    locations = cells_column_labels(
+        columns = vars(perc_agreed))) %>%
+tab_options(
+    heading.background.color = tableColor,
+    column_labels.background.color = tableColor)
+
+```
+
+# Interview length
+
+```{r interview_length}
+
+interviewers_and_interviews <- full_join(interviewers, interviews_metadata, by = c("interviewer" = "interviewer"))
+
+interview_length <- int_stats %>%
+    separate(
+        col = interview__duration, 
+        sep = "\\.|:", 
+        into = c("days", "hours", "minutes", "seconds"), 
+        remove = FALSE) %>%
+    mutate_at(c("days", "hours", "minutes", "seconds"), .funs = as.numeric) %>%
+    mutate(duration = 
+        ((24*60)*days)  +   # minutes = (24 hours/day) & (60 minutes/hour)
+        (60*hours)      +   # minutes = (60 minutes/hour) 
+        minutes         +
+        (seconds/60)
+    ) %>% 
+    left_join(select(hholds, interview__id, interview__key, !!sym(params$interview_result)), by = c("interview__id", "interview__key"))
+
+length_stats <- compute_length_stats(
+    interviews_df = interviews_metadata, 
+    interview_complete = !!sym(params$interview_result) == 1,
+    interviewers_df = interviewers, 
+    length_df = interview_length, 
+    group_var = interviewer, 
+    overall_txt = "All interviewers")
+
+length_stats %>%
+gt(rowname_col = "interviewer") %>%
+tab_header(title = "Length of completed interviews by interviewer") %>%
+cols_label(
+    num_obs = html("Interviews<br>(N)"),
+    minimum = "Min",
+    lower_hinge = "Q1",
+    median = "Med",
+    upper_hinge = "Q3",
+    maximum = "Max"
+) %>% 
+tab_spanner(
+    columns = vars(minimum, lower_hinge, median, upper_hinge, maximum),
+    label = "Length"
+) %>%
+fmt_number(
+    columns = vars(minimum, lower_hinge, median, upper_hinge, maximum),
+    decimals = 2
+) %>% 
+fmt_missing(
+    columns = everything()
+) %>%
+tab_options(
+    heading.background.color = tableColor,
+    column_labels.background.color = tableColor)
+
+
+```
+
+# Attempts by time
+
+## Day of week
+
+```{r attempt_timing}
+
+when_attempted <- attempts %>%
+mutate(
+    date_time = ymd_hms(!!sym(params$attempt_time)),
+    date = date(date_time),
+    day = wday(date, label = FALSE, week_start = getOption("lubridate.week.start", 1)), # start week with Monday
+    hour = hour(date_time),
+    # day of the week indicator variables
+    day_mon = (day == 1),
+    day_tues = (day == 2),
+    day_wed = (day == 3),
+    day_thurs = (day == 4),
+    day_fri = (day == 5),
+    day_sat = (day == 6),
+    day_sun = (day == 7),
+    # hour of the day indicator variable
+    time_8minus = (hour < 8),
+    time_8_10 = (hour >= 8 & hour < 10),
+    time_10_12 = (hour >= 10 & hour < 12),
+    time_12_14 = (hour >= 12 & hour < 14),
+    time_14_16 = (hour >= 14 & hour < 16),
+    time_16_18 = (hour >= 16 & hour < 18),
+    time_18_20 = (hour >= 18 & hour < 20),
+    time_20plus = (hour > 20)
+) %>%
+select(interview__id, interview__key, !!attempt_id_sym, starts_with("day_"), starts_with("time_"))
+
+attempt_time_stats_by_interviewer <- full_join(
+    interviewers, interviews_metadata, 
+        by = c("interviewer", "supervisor")) %>%
+    left_join(when_attempted, by = c("interview__id", "interview__key")) %>%
+    group_by(interviewer) %>%
+    summarise_at(.vars = vars(starts_with("day_"), starts_with("time_")), .funs = sum, na.rm = TRUE) %>%
+    mutate(num_attempts = rowSums(select(., starts_with("day_")), na.rm = TRUE)) %>%
+    mutate_at(
+        .vars = vars(starts_with("day_"), starts_with("time_")), 
+        .funs = ~ if_else(condition = . != 0,
+        true = ./num_attempts,
+        false = NA_real_,
+        missing = NA_real_)) %>%
+    ungroup()
+
+attempt_time_stats_overall <- full_join(
+    interviewers, interviews_metadata, 
+        by = c("interviewer", "supervisor")) %>%
+    left_join(when_attempted, by = c("interview__id", "interview__key")) %>%
+    summarise_at(.vars = vars(starts_with("day_"), starts_with("time_")), .funs = sum, na.rm = TRUE) %>%
+    mutate(num_attempts = rowSums(select(., starts_with("day_")), na.rm = TRUE)) %>%
+    mutate_at(
+        .vars = vars(starts_with("day_"), starts_with("time_")), 
+        .funs = ~ if_else(condition = . != 0,
+        true = ./num_attempts,
+        false = NA_real_,
+        missing = NA_real_)) %>%
+    mutate(interviewer = "All interviewers")
+
+attempt_time_stats <- rbind(attempt_time_stats_by_interviewer, attempt_time_stats_overall)
+
+```
+
+```{r attempt_day_of_week}
+
+select(attempt_time_stats, interviewer, num_attempts, starts_with("day_")) %>%
+gt(rowname_col = "interviewer") %>%
+cols_label(
+    num_attempts = html("Attempts<br>(N)"),
+    day_mon = "Mon.",
+    day_tues = "Tues.",
+    day_wed = "Wed.",
+    day_thurs = "Thurs.",
+    day_fri = "Fri.",
+    day_sat = "Sat.",
+    day_sun = "Sun."
+) %>%
+tab_spanner(
+    columns = starts_with("day_"),
+    label = "Day of the week (%)"
+) %>%
+fmt_number(
+    columns = starts_with("day_"),
+    scale_by = 100
+) %>%
+fmt_missing(
+    columns = everything()
+) %>%
+tab_options(
+    heading.background.color = tableColor,
+    column_labels.background.color = tableColor) 
+
+```
+
+## Time of day
+
+```{r attempt_hour_of_day}
+
+select(attempt_time_stats, interviewer, num_attempts, starts_with("time_")) %>%
+gt(rowname_col = "interviewer") %>%
+cols_label(
+    num_attempts = html("Attempts<br>(N)"),
+    time_8minus = "< 8",
+    time_8_10 = "8-10",
+    time_10_12 = "10-12",
+    time_12_14 = "12-14",
+    time_14_16 = "2-4",
+    time_16_18 = "4-6",
+    time_18_20 = "6-8",
+    time_20plus = "> 20"
+) %>%
+tab_spanner(
+    columns = starts_with("time_"),
+    label = "Time of day (%)"
+) %>%
+fmt_number(
+    columns = starts_with("time_"),
+    scale_by = 100
+) %>%
+fmt_missing(
+    columns = everything()
+) %>%
+tab_options(
+    heading.background.color = tableColor,
+    column_labels.background.color = tableColor) 
+
+```
+
+# Contacts by time
+
+```{r contact_timing}
+
+attempts_count <- attempts %>%
+    mutate(num_attempts = TRUE) %>%
+    select(interview__id, interview__key, !!attempt_id_sym, num_attempts)
+
+when_contacted <- attempts %>%
+filter(!!sym(params$answered_var) == 1) %>%
+mutate(
+    date_time = ymd_hms(!!sym(params$attempt_time)),
+    date = date(date_time),
+    day = wday(date, label = FALSE, week_start = getOption("lubridate.week.start", 1)), # start week with Monday
+    hour = hour(date_time),
+    # day of the week indicator variables
+    day_mon = (day == 1),
+    day_tues = (day == 2),
+    day_wed = (day == 3),
+    day_thurs = (day == 4),
+    day_fri = (day == 5),
+    day_sat = (day == 6),
+    day_sun = (day == 7),
+    # hour of the day indicator variable
+    time_8minus = (hour < 8),
+    time_8_10 = (hour >= 8 & hour < 10),
+    time_10_12 = (hour >= 10 & hour < 12),
+    time_12_14 = (hour >= 12 & hour < 14),
+    time_14_16 = (hour >= 14 & hour < 16),
+    time_16_18 = (hour >= 16 & hour < 18),
+    time_18_20 = (hour >= 18 & hour < 20),
+    time_20plus = (hour > 20)
+) %>%
+select(interview__id, interview__key, !!attempt_id_sym, starts_with("day_"), starts_with("time_"))
+
+contacts <- left_join(attempts_count, when_contacted, 
+    by = c("interview__id", "interview__key", attempt_id_str))
+
+contact_time_stats_by_interviewer <- full_join(
+    interviewers, interviews_metadata, 
+        by = c("interviewer", "supervisor")) %>%
+    left_join(contacts, by = c("interview__id", "interview__key")) %>%
+    group_by(interviewer) %>%
+    summarise_at(.vars = vars(starts_with("day_"), starts_with("time_"), num_attempts), .funs = sum, na.rm = TRUE) %>%
+    ungroup() %>%
+    mutate(num_contacts = rowSums(select(., starts_with("day_")), na.rm = TRUE)) %>%
+    mutate_at(
+        .vars = vars(starts_with("day_"), starts_with("time_")), 
+        .funs = ~ if_else(condition = . != 0,
+        true = ./num_contacts,
+        false = NA_real_,
+        missing = NA_real_))
+
+contact_time_stats_overall <- full_join(
+    interviewers, interviews_metadata, 
+        by = c("interviewer", "supervisor")) %>%
+    left_join(contacts, by = c("interview__id", "interview__key")) %>%
+    summarise_at(.vars = vars(starts_with("day_"), starts_with("time_"), num_attempts), .funs = sum, na.rm = TRUE) %>%
+    mutate(num_contacts = rowSums(select(., starts_with("day_")), na.rm = TRUE)) %>%
+    mutate_at(
+        .vars = vars(starts_with("day_"), starts_with("time_")), 
+        .funs = ~ if_else(condition = . != 0,
+        true = ./num_contacts,
+        false = NA_real_,
+        missing = NA_real_)) %>%
+    mutate(interviewer = "All interviewers")
+
+contact_time_stats <- rbind(contact_time_stats_by_interviewer, contact_time_stats_overall)
+
+```
+
+## Day of the week
+
+```{r contact_day_of_week} 
+
+select(contact_time_stats, interviewer, num_attempts, num_contacts, starts_with("day_")) %>%
+gt(rowname_col = "interviewer") %>%
+cols_label(
+    num_attempts = "Attempts",
+    num_contacts = "Contacts",
+    day_mon = "Mon.",
+    day_tues = "Tues.",
+    day_wed = "Wed.",
+    day_thurs = "Thurs.",
+    day_fri = "Fri.",
+    day_sat = "Sat.",
+    day_sun = "Sun."
+) %>%
+tab_spanner(
+    columns = starts_with("num_"),
+    label = "Contact attempts (N)"
+) %>%
+tab_spanner(
+    columns = starts_with("day_"),
+    label = "Day of the week (%)"
+) %>%
+fmt_number(
+    columns = starts_with("day_"),
+    scale_by = 100
+) %>%
+fmt_missing(
+    columns = everything()
+) %>%
+tab_options(
+    heading.background.color = tableColor,
+    column_labels.background.color = tableColor) 
+
+```
+
+## Time of day
+
+```{r contact_hour_of_day} 
+
+select(contact_time_stats, interviewer, num_attempts, num_contacts, starts_with("time_")) %>%
+gt(rowname_col = "interviewer") %>%
+cols_label(
+    num_attempts = "Attempts",
+    num_contacts = "Contacts",
+    time_8minus = "< 8",
+    time_8_10 = "8-10",
+    time_10_12 = "10-12",
+    time_12_14 = "12-14",
+    time_14_16 = "2-4",
+    time_16_18 = "4-6",
+    time_18_20 = "6-8",
+    time_20plus = "> 20"
+) %>%
+tab_spanner(
+    columns = starts_with("num_"),
+    label = "Contact attempts (N)"
+) %>%
+tab_spanner(
+    columns = starts_with("time_"),
+    label = "Time of day (%)"
+) %>%
+fmt_number(
+    columns = starts_with("time_"),
+    scale_by = 100
+) %>%
+fmt_missing(
+    columns = everything()
+) %>%
+tab_options(
+    heading.background.color = tableColor,
+    column_labels.background.color = tableColor) 
+
+```
+
+# Outstanding assignments
+
+```{r pending_assignments}
+
+last_sync_by_interviewer <- get_last_suso_sync(
+	interviewers = interviewers,
+	startDate = params$reportStart,
+	endDate = params$reportEnd,
+	site = params$site, user = params$user, password = params$password) %>%
+    left_join(interviewers) %>%
+    rename(last_sync = lastSync) %>%
+    select(interviewer, supervisor, last_sync)
+
+# TODO: use Sys.time() instead
+# Example output: "2020-04-15 10:32:26 EDT"
+current_date <- Sys.Date()
+
+interviewer_days_since_last_sync <- last_sync_by_interviewer %>%
+    mutate(days = current_date - last_sync)
+    
+assignments_sent <- assign_actions %>%
+    group_by(assignment__id) %>%
+    summarize(
+        date_assignment_made = first(date[action == 1]),
+        date_assignment_received = last(date[action == 4]),
+        interviewer = last(responsible__name[responsible__role == 1])
+    ) %>%
+    ungroup() %>%
+    mutate(received = !is.na(date_assignment_received)) %>%
+    mutate_at(.vars = vars(matches("date")), .funs = ymd) %>%
+    mutate(date_last_info = pmax(date_assignment_made, date_assignment_received, na.rm = TRUE))
+
+on_server_statuses <- c(
+    40, # SupervisorAssigned
+    100, # Completed
+    120, # ApprovedBySupervisor
+    130 # ApprovedByHeadquarters
+    )
+
+interviews_received <- interviews_metadata %>%
+    filter(interview__status %in% on_server_statuses)
+
+cases_outstanding <- assignments_sent %>% 
+    anti_join(interviews_received, by = "assignment__id")
+
+cases_outstanding_stats <- cases_outstanding %>%
+    mutate(
+        days_out = current_date - date_last_info,
+        days_4minus = (days_out <= 4),
+        days_5 = (days_out == 5),
+        days_6 = (days_out == 6),
+        days_7 = (days_out == 7),
+        days_8plus = (days_out >= 8)         
+    ) %>%
+    group_by(interviewer) %>%
+    summarize(
+        num_sent = n(),
+        num_received = sum(received == TRUE, na.rm = TRUE),
+        num_days_4minus = sum(received == TRUE & days_4minus == TRUE, na.rm = TRUE),
+        num_days_5 = sum(received == TRUE & days_5 == TRUE, na.rm = TRUE),
+        num_days_6 = sum(received == TRUE & days_6 == TRUE, na.rm = TRUE),
+        num_days_7 = sum(received == TRUE & days_7 == TRUE, na.rm = TRUE),
+        num_days_8plus = sum(received == TRUE & days_8plus == TRUE, na.rm = TRUE)        
+    )
+
+outstanding_work_stats <- 
+    full_join(
+        interviewer_days_since_last_sync, 
+        cases_outstanding_stats,
+        by = "interviewer") %>%
+    select(-c(supervisor, last_sync)) %>%
+    arrange(desc(interviewer))
+
+
+outstanding_work_stats %>%
+gt(rowname_col = "interviewer") %>%
+cols_label(
+    days = "Days since last sync",
+    num_sent = html("Sent"),
+    num_received = html("On tablet"),
+    num_days_4minus = "<= 4",
+    num_days_5 = "5",
+    num_days_6 = "6",
+    num_days_7 = "7",
+    num_days_8plus = ">= 8"
+) %>%
+tab_spanner(
+    columns = vars(num_sent, num_received),
+    label = "Total assignments"
+) %>%
+tab_spanner(
+    columns = starts_with("num_days"),
+    label = "By days outstanding"
+) %>%
+fmt_missing(
+    columns = everything()
+) %>%
+fmt_missing(
+    columns = vars(days),
+    missing_text = "Never"
+) %>%
+tab_style(
+    style = list(
+        cell_text(
+            color = "red",
+            style = "italic"
+        )
+    ),
+    locations = cells_body(
+        columns = vars(days),
+        rows = days > 4
+    )
+) %>%
+tab_style(
+    style = list(
+        cell_text(
+            color = "red",
+            weight = "bold"
+        )
+    ),
+    locations = cells_body(
+        columns = vars(days),
+        rows = is.na(days)
+    )
+
+) %>%
+tab_options(
+    heading.background.color = tableColor,
+    column_labels.background.color = tableColor)
+
+
+```
+
+# Interviews completed over time
+
+```{r interivews_completed}
+
+library(tidyr)
+
+# extract first completion date and interviewer from interview actions file
+when <- when_interview_completed(file_actions = paste0(hhDataDir, "interview__actions.dta"))
+
+# count the number of interviews completed per interviewer per day
+count_per_person_day <- when %>% 
+    group_by(interviewer, date) %>% 
+    summarize(count = n()) %>% 
+    ungroup() %>% 
+    mutate(date = as.Date(date))
+
+# expand the set of interviewer-day combinations to cover the full survey period
+# ...first, by defining the set of interviewer-day combinations
+people_day_combos <- expand(count_per_person_day, interviewer, 
+    date = seq.Date(from = as.Date(params$reportStart), to = as.Date(params$reportEnd), by = 1))
+
+# ...then, by joining that to the data
+count_per_person_day_full <- full_join(count_per_person_day, people_day_combos, 
+        by = c("interviewer", "date")) %>% 
+    mutate(date = as.character(date)) %>%
+    arrange(interviewer, date)
+
+# reshape data from long to wide, with dates as columns and interviewers as rows
+int_count_by_day <- pivot_wider(
+    data = count_per_person_day_full, 
+    id_cols = interviewer, 
+    names_from = date, 
+    values_from = count)
+
+# create heatmap of interviews per day
+int_count_by_day %>%
+gt(rowname_col = "interviewer") %>%
+data_color(
+    columns = everything(),
+    colors = scales::col_numeric(
+        palette = c(
+            "red", "orange", "yellow"),
+        domain = c(
+            min(count_per_person_day_full$count, na.rm = TRUE), 
+            max(count_per_person_day_full$count, na.rm = TRUE))
+    )
+) %>%
+fmt_missing(
+    columns = everything(),
+    missing_text = "-"
+)
+
+```

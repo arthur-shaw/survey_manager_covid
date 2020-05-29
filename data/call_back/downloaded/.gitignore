@@ -1,0 +1,3 @@
+# zip archives and Stata data files
+*.zip
+*.dta

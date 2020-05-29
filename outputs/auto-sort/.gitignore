@@ -1,0 +1,6 @@
+# Stata data files
+*.dta
+
+# Excel files
+*.xlsx
+*.xls
