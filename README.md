@@ -1,4 +1,4 @@
-# Survol
+# Overview
 
 <img src="assets/actions.PNG">
 
@@ -13,7 +13,7 @@ Assign            |  Download | Monitor
 ![](assets/affecter.PNG)  | ![](assets/download.PNG) | ![](assets/monitor.PNG)
 
 
-#  Table des matières:
+#  Table of contents:
 
 - [Installation](#installation)
 - [Usage](#usage)
