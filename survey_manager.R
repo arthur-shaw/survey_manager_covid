@@ -213,10 +213,10 @@ ui <- tagList(
 			tabPanel("Approve/reject", icon = icon("laptop-code"), value = "action_auto_sort",
 				h2("Run auto-sort"),
 				checkboxInput("autosort_acts", label = "Approve/reject when run", value = FALSE),
-				actionButton("run_autosort", label = "Exécuter", icon = icon("code")), 
+				actionButton("run_autosort", label = "Run", icon = icon("code")), 
 				h2("Create auto-sort report"),
-				tags$p("NOTE: This button doesn't work ye"),
-				actionButton("make_autosort_report", label = "Créer", icon = icon("chart-bar"))
+				tags$p("NOTE: This button doesn't work yet"),
+				actionButton("make_autosort_report", label = "Create", icon = icon("chart-bar"))
 			),
 			tabPanel("Monitor", icon = icon("table"), value = "action_fcheck",
 				conditionalPanel(condition = "output.got_teams == 1",
